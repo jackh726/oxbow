@@ -95,23 +95,16 @@ fn read_bigwig(
     path_or_file_like: PyObject,
     region: Option<&str>,
     zoom_level: Option<u32>,
-    zoom_summary_columns: Option<HashSet<&str>>,
+    zoom_summary_columns: Option<HashSet<String>>,
 ) -> PyObject {
     if let Ok(string_ref) = path_or_file_like.downcast::<PyString>(py) {
         // If it's a string, treat it as a path
         let mut reader = BigWigReader::new_from_path(string_ref.to_str().unwrap()).unwrap();
-        match zoom_level {
-            Some(zoom_level) => {
-                let ipc = reader
-                    .zoom_records_to_ipc(region, zoom_level, zoom_summary_columns)
-                    .unwrap();
-                Python::with_gil(|py| PyBytes::new(py, &ipc).into())
-            }
-            None => {
-                let ipc = reader.records_to_ipc(region).unwrap();
-                Python::with_gil(|py| PyBytes::new(py, &ipc).into())
-            }
-        }
+        region.map(|r| reader.with_region(r).unwrap());
+        zoom_level.map(|zoom_level| reader.using_zoom(zoom_level));
+        zoom_summary_columns.map(|columns| reader.with_zoom_summary_columns(columns));
+        let ipc = reader.records_to_ipc().unwrap();
+        Python::with_gil(|py| PyBytes::new(py, &ipc).into())
     } else {
         // Otherwise, treat it as file-like
         let file_like = match PyFileLikeObject::new(path_or_file_like, true, false, true) {
@@ -119,23 +112,21 @@ fn read_bigwig(
             Err(_) => panic!("Unknown argument for `path_url_or_file_like`. Not a file path string or url, and not a file-like object."),
         };
         let mut reader = BigWigReader::new(file_like).unwrap();
-        match zoom_level {
-            Some(zoom_level) => {
-                let ipc = reader
-                    .zoom_records_to_ipc(region, zoom_level, zoom_summary_columns)
-                    .unwrap();
-                Python::with_gil(|py| PyBytes::new(py, &ipc).into())
-            }
-            None => {
-                let ipc = reader.records_to_ipc(region).unwrap();
-                Python::with_gil(|py| PyBytes::new(py, &ipc).into())
-            }
-        }
+        region.map(|r| reader.with_region(r).unwrap());
+        zoom_level.map(|zoom_level| reader.using_zoom(zoom_level));
+        zoom_summary_columns.map(|columns| reader.with_zoom_summary_columns(columns));
+        let ipc = reader.records_to_ipc().unwrap();
+        Python::with_gil(|py| PyBytes::new(py, &ipc).into())
     }
 }
 
 #[pyfunction]
-fn read_bigbed(py: Python, path_or_file_like: PyObject, region: Option<&str>, fields: Option<HashSet<&str>>) -> PyObject {
+fn read_bigbed(
+    py: Python,
+    path_or_file_like: PyObject,
+    region: Option<&str>,
+    fields: Option<HashSet<&str>>,
+) -> PyObject {
     if let Ok(string_ref) = path_or_file_like.downcast::<PyString>(py) {
         // If it's a string, treat it as a path
         let mut reader = BigBedReader::new_from_path(string_ref.to_str().unwrap()).unwrap();

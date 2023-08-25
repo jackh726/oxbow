@@ -16,6 +16,9 @@ use crate::batch_builder::{finish_batch, BatchBuilder};
 /// A BigWig reader.
 pub struct BigWigReader<R> {
     read: BigWigRead<R>,
+    region: Option<(String, u32, u32)>,
+    zoom_level: Option<u32>,
+    zoom_summary_columns: Option<HashSet<String>>,
 }
 
 pub struct BigWigRecord<'a, Value> {
@@ -30,7 +33,12 @@ impl BigWigReader<ReopenableFile> {
     pub fn new_from_path(path: &str) -> std::io::Result<Self> {
         let read = BigWigRead::open_file(path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        Ok(Self { read })
+        Ok(Self {
+            read,
+            region: None,
+            zoom_level: None,
+            zoom_summary_columns: None,
+        })
     }
 }
 
@@ -39,13 +47,22 @@ impl<R: Read + Seek> BigWigReader<R> {
     pub fn new(read: R) -> std::io::Result<Self> {
         let read = BigWigRead::open(read)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        Ok(Self { read })
+        Ok(Self {
+            read,
+            region: None,
+            zoom_level: None,
+            zoom_summary_columns: None,
+        })
     }
 
-    fn start_end_from_region(&mut self, region: &str) -> Result<(String, u32, u32), ArrowError> {
-        let region: Region = region.parse().unwrap();
+    /// Specifies what region to return values overlapping for. If not called,
+    /// all values will be returned.
+    pub fn with_region(&mut self, region: &str) -> Result<(), ArrowError> {
+        let region: Region = region
+            .parse()
+            .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
         let chrom_name = region.name().to_owned();
-        Ok(match (region.interval().start(), region.interval().end()) {
+        let region = match (region.interval().start(), region.interval().end()) {
             (Some(start), Some(end)) => {
                 let start = start.get() as u32 - 1; // 1-based to 0-based
                 let end = end.get() as u32;
@@ -82,69 +99,18 @@ impl<R: Read + Seek> BigWigReader<R> {
                 })?;
                 (chrom_name, start, end)
             }
-        })
+        };
+        self.region = Some(region);
+
+        Ok(())
     }
 
-    /// Returns the records in the given region as Apache Arrow IPC.
-    ///
-    /// If the region is `None`, all records are returned.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use oxbow::bigwig::BigWigReader;
-    ///
-    /// let mut reader = BigWigReader::new_from_path("sample.bigWig").unwrap();
-    /// let ipc = reader.records_to_ipc(Some("sq0:1-1000")).unwrap();
-    /// ```
-    pub fn records_to_ipc(&mut self, region: Option<&str>) -> Result<Vec<u8>, ArrowError> {
-        let capacity = 1024;
-        let mut batch_builder =
-            BigWigBatchBuilder::new(capacity, Float32Array::builder(capacity), &mut self.read)?;
-        match region {
-            Some(region) => {
-                let (chrom_name, start, end) = self.start_end_from_region(region)?;
-                let values = self
-                    .read
-                    .get_interval(&chrom_name, start, end)
-                    .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
-                for value in values {
-                    let v = value.unwrap();
-                    let record = BigWigRecord {
-                        chrom: &chrom_name,
-                        start: v.start,
-                        end: v.end,
-                        value: v.value,
-                    };
-                    batch_builder.push(record);
-                }
-            }
-            None => {
-                // Can't use write_ipc, because we have separate iterators for each chrom
-                let chroms = self.read.get_chroms().into_iter();
-                for chrom in chroms {
-                    let start = 0;
-                    let end = chrom.length;
-                    let values = self.read.get_interval(&chrom.name, start, end).unwrap();
-                    for value in values {
-                        let v = value.unwrap();
-                        let record = BigWigRecord {
-                            chrom: &chrom.name,
-                            start: v.start,
-                            end: v.end,
-                            value: v.value,
-                        };
-                        batch_builder.push(record);
-                    }
-                }
-            }
-        }
-        finish_batch(batch_builder)
+    pub fn using_zoom(&mut self, zoom_level: u32) {
+        self.zoom_level = Some(zoom_level);
     }
 
-    /// Returns the records in the given region as Apache Arrow IPC.
-    ///
-    /// If the region is `None`, all records are returned.
+    /// Specifies what values to query from zoom summary data. Only useful if
+    /// `using_zoom` is called.
     ///
     /// Valid columns are:
     ///   - total_items
@@ -153,93 +119,136 @@ impl<R: Read + Seek> BigWigReader<R> {
     ///   - max
     ///   - sum
     ///   - sum_squares
+    pub fn with_zoom_summary_columns(&mut self, columns: HashSet<String>) {
+        self.zoom_summary_columns = Some(columns);
+    }
+
+    /// Returns the records in the given region as Apache Arrow IPC.
+    ///
+    /// If the region is `None`, all records are returned.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use oxbow::bigwig::BigWigReader;
-    /// use std::collections::HashSet;
     ///
     /// let mut reader = BigWigReader::new_from_path("sample.bigWig").unwrap();
-    /// let ipc = reader.zoom_records_to_ipc(Some("sq0:1-1000"), 1024, Some(HashSet::from_iter(["sum", "bases_covered"]))).unwrap();
+    /// reader.with_region("sq0:1-1000").unwrap();
+    /// let ipc = reader.records_to_ipc().unwrap();
     /// ```
-    pub fn zoom_records_to_ipc(
-        &mut self,
-        region: Option<&str>,
-        zoom_level: u32,
-        columns: Option<HashSet<&str>>,
-    ) -> Result<Vec<u8>, ArrowError> {
+    pub fn records_to_ipc(self) -> Result<Vec<u8>, ArrowError> {
+        match self.zoom_level {
+            Some(zoom_level) => self.internal_zoom_records_to_ipc(zoom_level),
+            None => self.internal_records_to_ipc(),
+        }
+    }
+
+    fn internal_records_to_ipc(mut self) -> Result<Vec<u8>, ArrowError> {
+        let capacity = 1024;
+        let mut batch_builder =
+            BigWigBatchBuilder::new(capacity, Float32Array::builder(capacity), &mut self.read)?;
+
+        macro_rules! push_value {
+            ($chrom_name:expr, $value:expr) => {
+                let v = $value.map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+                let record = BigWigRecord {
+                    chrom: $chrom_name,
+                    start: v.start,
+                    end: v.end,
+                    value: v.value,
+                };
+                batch_builder.push(record);
+            };
+        }
+        match self.region {
+            Some((chrom_name, start, end)) => {
+                let values = self
+                    .read
+                    .get_interval(&chrom_name, start, end)
+                    .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+                for value in values {
+                    push_value!(&chrom_name, value);
+                }
+            }
+            None => {
+                let chroms = self.read.get_chroms().into_iter();
+                for chrom in chroms {
+                    let start = 0;
+                    let end = chrom.length;
+                    let values = self.read.get_interval(&chrom.name, start, end).unwrap();
+                    for value in values {
+                        push_value!(&chrom.name, value);
+                    }
+                }
+            }
+        }
+        finish_batch(batch_builder)
+    }
+
+    fn internal_zoom_records_to_ipc(mut self, zoom_level: u32) -> Result<Vec<u8>, ArrowError> {
         let capacity = 1024;
         let builder = (
-            columns
+            self.zoom_summary_columns
                 .as_ref()
                 .map_or(true, |c| c.contains("total_items"))
                 .then(|| UInt64Array::builder(capacity)),
-            columns
+            self.zoom_summary_columns
                 .as_ref()
                 .map_or(true, |c| c.contains("bases_covered"))
                 .then(|| UInt64Array::builder(capacity)),
-            columns
+            self.zoom_summary_columns
                 .as_ref()
                 .map_or(true, |c| c.contains("min"))
                 .then(|| Float64Array::builder(capacity)),
-            columns
+            self.zoom_summary_columns
                 .as_ref()
                 .map_or(true, |c| c.contains("max"))
                 .then(|| Float64Array::builder(capacity)),
-            columns
+            self.zoom_summary_columns
                 .as_ref()
                 .map_or(true, |c| c.contains("sum"))
                 .then(|| Float64Array::builder(capacity)),
-            columns
+            self.zoom_summary_columns
                 .as_ref()
                 .map_or(true, |c| c.contains("sum_Squares"))
                 .then(|| Float64Array::builder(capacity)),
         );
         let mut batch_builder = BigWigBatchBuilder::new(capacity, builder, &mut self.read)?;
-        match region {
-            Some(region) => {
-                let (chrom_name, start, end) = self.start_end_from_region(region)?;
+
+        macro_rules! push_value {
+            ($chrom_name:expr, $value:expr) => {
+                let v = $value.map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+                let record = BigWigRecord {
+                    chrom: $chrom_name,
+                    start: v.start,
+                    end: v.end,
+                    value: v.summary,
+                };
+                batch_builder.push(record);
+            };
+        }
+        match self.region {
+            Some((chrom_name, start, end)) => {
                 let values = self
                     .read
                     .get_zoom_interval(&chrom_name, start, end, zoom_level)
                     .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
                 for value in values {
-                    let v = value.unwrap();
-                    let record = BigWigRecord {
-                        chrom: &chrom_name,
-                        start: v.start,
-                        end: v.end,
-                        value: v.summary,
-                    };
-                    batch_builder.push(record);
+                    push_value!(&chrom_name, value);
                 }
             }
             None => {
-                // Can't use write_ipc, because we have separate iterators for each chrom
                 let chroms = self.read.get_chroms().into_iter();
                 for chrom in chroms {
                     let start = 0;
                     let end = chrom.length;
-                    let values =
-                        match self
-                            .read
-                            .get_zoom_interval(&chrom.name, start, end, zoom_level)
-                        {
-                            Ok(v) => v,
-                            Err(e) => {
-                                return Err(ArrowError::ExternalError(Box::new(e)));
-                            }
-                        };
+                    let values = self
+                        .read
+                        .get_zoom_interval(&chrom.name, start, end, zoom_level)
+                        .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+                    let chrom_name = &chrom.name;
                     for value in values {
-                        let v = value.unwrap();
-                        let record = BigWigRecord {
-                            chrom: &chrom.name,
-                            start: v.start,
-                            end: v.end,
-                            value: v.summary,
-                        };
-                        batch_builder.push(record);
+                        push_value!(chrom_name, value);
                     }
                 }
             }
@@ -380,7 +389,10 @@ mod tests {
         let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         dir.push("../fixtures/valid.bigWig");
         let mut reader = BigWigReader::new_from_path(dir.to_str().unwrap()).unwrap();
-        let ipc = reader.records_to_ipc(region).unwrap();
+        if let Some(region) = region {
+            reader.with_region(region).unwrap();
+        }
+        let ipc = reader.records_to_ipc().unwrap();
         let cursor = std::io::Cursor::new(ipc);
         let mut arrow_reader = FileReader::try_new(cursor, None).unwrap();
         // make sure we have one batch
@@ -392,7 +404,11 @@ mod tests {
         let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         dir.push("../fixtures/valid.bigWig");
         let mut reader = BigWigReader::new_from_path(dir.to_str().unwrap()).unwrap();
-        let ipc = reader.zoom_records_to_ipc(region, 10240, None).unwrap();
+        if let Some(region) = region {
+            reader.with_region(region).unwrap();
+        }
+        reader.using_zoom(10240);
+        let ipc = reader.records_to_ipc().unwrap();
         let cursor = std::io::Cursor::new(ipc);
         let mut arrow_reader = FileReader::try_new(cursor, None).unwrap();
         // make sure we have one batch
